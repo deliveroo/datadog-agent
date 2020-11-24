@@ -447,9 +447,6 @@ func (s *Server) parseMetricMessage(parser *parser, message []byte, originTagsFu
 		tlmProcessed.IncWithTags(tlmProcessedErrorTags)
 		return metrics.MetricSample{}, err
 	}
-	if s.filter != nil {
-		sample.tags = s.filter.Filter(sample.tags)
-	}
 	if s.mapper != nil {
 		mapResult := s.mapper.Map(sample.name)
 		if mapResult != nil {
@@ -460,6 +457,11 @@ func (s *Server) parseMetricMessage(parser *parser, message []byte, originTagsFu
 	}
 	metricSample := enrichMetricSample(sample, s.metricPrefix, s.metricPrefixBlacklist, s.defaultHostname, originTagsFunc, s.entityIDPrecedenceEnabled)
 	metricSample.Tags = append(metricSample.Tags, s.extraTags...)
+
+	if s.filter != nil {
+		metricSample.Tags = s.filter.Filter(metricSample.Tags)
+	}
+
 	dogstatsdMetricPackets.Add(1)
 	tlmProcessed.IncWithTags(tlmProcessedOkTags)
 	return metricSample, nil
