@@ -22,6 +22,7 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/aggregator"
 	"github.com/DataDog/datadog-agent/pkg/aggregator/ckey"
 	"github.com/DataDog/datadog-agent/pkg/config"
+	"github.com/DataDog/datadog-agent/pkg/dogstatsd/filter"
 	"github.com/DataDog/datadog-agent/pkg/dogstatsd/listeners"
 	"github.com/DataDog/datadog-agent/pkg/dogstatsd/mapper"
 	"github.com/DataDog/datadog-agent/pkg/metrics"
@@ -82,6 +83,7 @@ type Server struct {
 	histToDist                bool
 	histToDistPrefix          string
 	extraTags                 []string
+	filter                    *filter.TagFilter
 	Debug                     *dsdServerDebug
 	mapper                    *mapper.MetricMapper
 	telemetryEnabled          bool
@@ -195,6 +197,15 @@ func NewServer(aggregator *aggregator.BufferedAggregator) (*Server, error) {
 	}
 	metricPrefixBlacklist := config.Datadog.GetStringSlice("statsd_metric_namespace_blacklist")
 
+	var tagFilter *filter.TagFilter
+	tagFilters := config.Datadog.GetStringSlice("dogstatsd_tag_filters")
+	if len(tagFilters) > 0 {
+		var err error
+		if tagFilter, err = filter.New(tagFilters); err != nil {
+			log.Errorf("Dogstatsd: unable to create tag filters: %s", err.Error())
+		}
+	}
+
 	defaultHostname, err := util.GetHostname()
 	if err != nil {
 		log.Errorf("Dogstatsd: unable to determine default hostname: %s", err.Error())
@@ -222,6 +233,7 @@ func NewServer(aggregator *aggregator.BufferedAggregator) (*Server, error) {
 		histToDist:                histToDist,
 		histToDistPrefix:          histToDistPrefix,
 		extraTags:                 extraTags,
+		filter:                    tagFilter,
 		telemetryEnabled:          telemetry_utils.IsEnabled(),
 		entityIDPrecedenceEnabled: entityIDPrecedenceEnabled,
 		disableVerboseLogs:        config.Datadog.GetBool("dogstatsd_disable_verbose_logs"),
@@ -448,6 +460,10 @@ func (s *Server) parseMetricMessage(parser *parser, message []byte, originTagsFu
 	}
 	metricSample := enrichMetricSample(sample, s.metricPrefix, s.metricPrefixBlacklist, s.defaultHostname, originTagsFunc, s.entityIDPrecedenceEnabled, s.ServerlessMode)
 	metricSample.Tags = append(metricSample.Tags, s.extraTags...)
+
+	if s.filter != nil {
+		metricSample.Tags = s.filter.Filter(metricSample.Tags)
+	}
 
 	dogstatsdMetricPackets.Add(1)
 	tlmProcessed.IncWithTags(tlmProcessedOkTags)
