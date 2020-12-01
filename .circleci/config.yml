@@ -177,6 +177,26 @@ jobs:
       - store_artifacts:
           path: omnibus/pkg
           destination: rpm
+      - persist_to_workspace:
+          root: omnibus
+          paths:
+            - pkg/*.rpm
+
+  upload_rpm:
+    docker:
+      - image: deliveroo/circleci:0.4.2
+
+    environment:
+      - TARGET: platform
+
+    steps:
+      - attach_workspace:
+          at: workspace
+      - run:
+          name: Push RPM package to S3
+          command: |
+            `print_env ${TARGET}`
+            aws s3 cp workspace/pkg/*.rpm "s3://roo-apps-private-binaries/datadog-agent/"
 
 workflows:
   version: 2
@@ -209,3 +229,7 @@ workflows:
             - unit_tests
             - integration_tests
             - docker_tests
+      - upload_rpm:
+          requires:
+            - build_rpm
+          filters: {branches: {only: master}}
