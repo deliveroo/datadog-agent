@@ -6,7 +6,6 @@
 package dogstatsd
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
 	"expvar"
@@ -36,14 +35,15 @@ import (
 )
 
 var (
-	dogstatsdExpvars                 = expvar.NewMap("dogstatsd")
-	dogstatsdServiceCheckParseErrors = expvar.Int{}
-	dogstatsdServiceCheckPackets     = expvar.Int{}
-	dogstatsdEventParseErrors        = expvar.Int{}
-	dogstatsdEventPackets            = expvar.Int{}
-	dogstatsdMetricParseErrors       = expvar.Int{}
-	dogstatsdMetricPackets           = expvar.Int{}
-	dogstatsdPacketsLastSec          = expvar.Int{}
+	dogstatsdExpvars                  = expvar.NewMap("dogstatsd")
+	dogstatsdServiceCheckParseErrors  = expvar.Int{}
+	dogstatsdServiceCheckPackets      = expvar.Int{}
+	dogstatsdEventParseErrors         = expvar.Int{}
+	dogstatsdEventPackets             = expvar.Int{}
+	dogstatsdMetricParseErrors        = expvar.Int{}
+	dogstatsdMetricPackets            = expvar.Int{}
+	dogstatsdPacketsLastSec           = expvar.Int{}
+	dogstatsdUnterminatedMetricErrors = expvar.Int{}
 
 	tlmProcessed = telemetry.NewCounter("dogstatsd", "processed",
 		[]string{"message_type", "state"}, "Count of service checks/events/metrics processed by dogstatsd")
@@ -58,6 +58,7 @@ func init() {
 	dogstatsdExpvars.Set("EventPackets", &dogstatsdEventPackets)
 	dogstatsdExpvars.Set("MetricParseErrors", &dogstatsdMetricParseErrors)
 	dogstatsdExpvars.Set("MetricPackets", &dogstatsdMetricPackets)
+	dogstatsdExpvars.Set("UnterminatedMetricErrors", &dogstatsdUnterminatedMetricErrors)
 }
 
 // Server represent a Dogstatsd server
@@ -87,6 +88,7 @@ type Server struct {
 	filter                    *filter.TagFilter
 	Debug                     *dsdServerDebug
 	mapper                    *mapper.MetricMapper
+	eolTerminationEnabled     bool
 	telemetryEnabled          bool
 	entityIDPrecedenceEnabled bool
 	// disableVerboseLogs is a feature flag to disable the logs capable
@@ -236,6 +238,7 @@ func NewServer(aggregator *aggregator.BufferedAggregator) (*Server, error) {
 		histToDistPrefix:          histToDistPrefix,
 		extraTags:                 extraTags,
 		filter:                    tagFilter,
+		eolTerminationEnabled:     config.Datadog.GetBool("dogstatsd_eol_required"),
 		telemetryEnabled:          telemetry_utils.IsEnabled(),
 		entityIDPrecedenceEnabled: entityIDPrecedenceEnabled,
 		disableVerboseLogs:        config.Datadog.GetBool("dogstatsd_disable_verbose_logs"),
@@ -353,13 +356,44 @@ func (s *Server) Flush(waitForSerializer bool) {
 	s.aggregator.Flush(time.Now().Add(time.Second*10), true)
 }
 
-func nextMessage(packet *[]byte) (message []byte) {
+// dropCR drops a terminal \r from the data.
+func dropCR(data []byte) []byte {
+	if len(data) > 0 && data[len(data)-1] == '\r' {
+		return data[0 : len(data)-1]
+	}
+	return data
+}
+
+// ScanLines is an almost identical reimplementation of bufio.ScanLines, but also
+// reports if the returned line is newline-terminated
+func ScanLines(data []byte, atEOF bool) (advance int, token []byte, eol bool, err error) {
+	if atEOF && len(data) == 0 {
+		return 0, nil, false, nil
+	}
+	if i := bytes.IndexByte(data, '\n'); i >= 0 {
+		// We have a full newline-terminated line.
+		return i + 1, dropCR(data[0:i]), true, nil
+	}
+	// If we're at EOF, we have a final, non-terminated line. Return it.
+	if atEOF {
+		return len(data), dropCR(data), false, nil
+	}
+	// Request more data.
+	return 0, nil, false, nil
+}
+
+func nextMessage(packet *[]byte, eolTermination bool) (message []byte) {
 	if len(*packet) == 0 {
 		return nil
 	}
 
-	advance, message, err := bufio.ScanLines(*packet, true)
+	advance, message, eol, err := ScanLines(*packet, true)
 	if err != nil {
+		return nil
+	}
+
+	if eolTermination && !eol {
+		dogstatsdUnterminatedMetricErrors.Add(1)
 		return nil
 	}
 
@@ -372,7 +406,7 @@ func (s *Server) parsePackets(batcher *batcher, parser *parser, packets []*liste
 		originTagger := originTags{origin: packet.Origin}
 		log.Tracef("Dogstatsd receive: %q", packet.Contents)
 		for {
-			message := nextMessage(&packet.Contents)
+			message := nextMessage(&packet.Contents, s.eolTerminationEnabled)
 			if message == nil {
 				break
 			}
