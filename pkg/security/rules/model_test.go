@@ -48,6 +48,10 @@ func (e *testEvent) GetType() string {
 	return e.kind
 }
 
+func (e *testEvent) GetTags() []string {
+	return nil
+}
+
 func (e *testEvent) GetPointer() unsafe.Pointer {
 	return unsafe.Pointer(e)
 }
@@ -75,7 +79,11 @@ func (m *testModel) ValidateField(key string, value eval.FieldValue) error {
 	return nil
 }
 
-func (m *testModel) GetEvaluator(key string) (eval.Evaluator, error) {
+func (m *testModel) GetIterator(field eval.Field) (eval.Iterator, error) {
+	return nil, &eval.ErrIteratorNotSupported{Field: field}
+}
+
+func (m *testModel) GetEvaluator(key string, regID eval.RegisterID) (eval.Evaluator, error) {
 	switch key {
 
 	case "process.name":

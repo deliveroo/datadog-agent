@@ -7,9 +7,9 @@ package rules
 
 import (
 	"fmt"
-
 	"github.com/hashicorp/go-multierror"
 	"github.com/pkg/errors"
+	"strings"
 
 	"github.com/DataDog/datadog-agent/pkg/security/secl/eval"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
@@ -29,9 +29,11 @@ type RuleID = string
 
 // RuleDefinition holds the definition of a rule
 type RuleDefinition struct {
-	ID         RuleID            `yaml:"id"`
-	Expression string            `yaml:"expression"`
-	Tags       map[string]string `yaml:"tags"`
+	ID          RuleID            `yaml:"id"`
+	Expression  string            `yaml:"expression"`
+	Description string            `yaml:"description"`
+	Tags        map[string]string `yaml:"tags"`
+	Policy      *Policy
 }
 
 // GetTags returns the tags associated to a rule
@@ -45,10 +47,16 @@ func (rd *RuleDefinition) GetTags() []string {
 	return tags
 }
 
+// Rule describes a rule of a ruleset
+type Rule struct {
+	*eval.Rule
+	Definition *RuleDefinition
+}
+
 // RuleSetListener describes the methods implemented by an object used to be
 // notified of events on a rule set.
 type RuleSetListener interface {
-	RuleMatch(rule *eval.Rule, event eval.Event)
+	RuleMatch(rule *Rule, event eval.Event)
 	EventDiscarderFound(rs *RuleSet, event eval.Event, field eval.Field, eventType eval.EventType)
 }
 
@@ -73,6 +81,7 @@ func NewOptsWithParams(constants map[string]interface{}, supportedDiscarders map
 // against it. If the rule matches, the listeners for this rule set are notified
 type RuleSet struct {
 	opts             *Opts
+	loadedPolicies   map[string]string
 	eventRuleBuckets map[eval.EventType]*RuleBucket
 	rules            map[eval.RuleID]*eval.Rule
 	model            eval.Model
@@ -89,6 +98,20 @@ func (rs *RuleSet) ListRuleIDs() []RuleID {
 		ids = append(ids, ruleID)
 	}
 	return ids
+}
+
+// ListMacroIDs returns the list of MacroIDs from the ruleset
+func (rs *RuleSet) ListMacroIDs() []MacroID {
+	var ids []string
+	for macroID := range rs.opts.Macros {
+		ids = append(ids, macroID)
+	}
+	return ids
+}
+
+// ListPolicies returns the list of loaded policies and their version
+func (rs *RuleSet) ListPolicies() map[string]string {
+	return rs.loadedPolicies
 }
 
 // AddMacros parses the macros AST and adds them to the list of macros of the ruleset
@@ -157,10 +180,13 @@ func (rs *RuleSet) AddRule(ruleDef *RuleDefinition) (*eval.Rule, error) {
 		tags = append(tags, k+":"+v)
 	}
 
-	rule := &eval.Rule{
-		ID:         ruleDef.ID,
-		Expression: ruleDef.Expression,
-		Tags:       tags,
+	rule := &Rule{
+		Rule: &eval.Rule{
+			ID:         ruleDef.ID,
+			Expression: ruleDef.Expression,
+			Tags:       tags,
+		},
+		Definition: ruleDef,
 	}
 
 	if err := rule.Parse(); err != nil {
@@ -197,13 +223,13 @@ func (rs *RuleSet) AddRule(ruleDef *RuleDefinition) (*eval.Rule, error) {
 	// Merge the fields of the new rule with the existing list of fields of the ruleset
 	rs.AddFields(rule.GetEvaluator().GetFields())
 
-	rs.rules[ruleDef.ID] = rule
+	rs.rules[ruleDef.ID] = rule.Rule
 
-	return rule, nil
+	return rule.Rule, nil
 }
 
 // NotifyRuleMatch notifies all the ruleset listeners that an event matched a rule
-func (rs *RuleSet) NotifyRuleMatch(rule *eval.Rule, event eval.Event) {
+func (rs *RuleSet) NotifyRuleMatch(rule *Rule, event eval.Event) {
 	for _, listener := range rs.listeners {
 		listener.RuleMatch(rule, event)
 	}
@@ -373,6 +399,11 @@ func (rs *RuleSet) generatePartials() error {
 	return nil
 }
 
+// AddPolicyVersion adds the provided policy filename and version to the map of loaded policies
+func (rs *RuleSet) AddPolicyVersion(filename string, version string) {
+	rs.loadedPolicies[strings.ReplaceAll(filename, ".", "_")] = version
+}
+
 // NewRuleSet returns a new ruleset for the specified data model
 func NewRuleSet(model eval.Model, eventCtor func() eval.Event, opts *Opts) *RuleSet {
 	return &RuleSet{
@@ -381,5 +412,6 @@ func NewRuleSet(model eval.Model, eventCtor func() eval.Event, opts *Opts) *Rule
 		opts:             opts,
 		eventRuleBuckets: make(map[eval.EventType]*RuleBucket),
 		rules:            make(map[eval.RuleID]*eval.Rule),
+		loadedPolicies:   make(map[string]string),
 	}
 }

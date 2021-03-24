@@ -15,9 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestSetupConfigs(t *testing.T) {
-	trueVar := true
-	falseVar := false
+func TestGetPrometheusConfigs(t *testing.T) {
 	tests := []struct {
 		name       string
 		config     []*common.PrometheusCheck
@@ -36,7 +34,6 @@ func TestSetupConfigs(t *testing.T) {
 						},
 					},
 					AD: &common.ADConfig{
-						ExcludeAutoconf: &trueVar,
 						KubeAnnotations: &common.InclExcl{
 							Excl: map[string]string{"prometheus.io/scrape": "false"},
 							Incl: map[string]string{"prometheus.io/scrape": "true"},
@@ -68,7 +65,6 @@ func TestSetupConfigs(t *testing.T) {
 						},
 					},
 					AD: &common.ADConfig{
-						ExcludeAutoconf: &trueVar,
 						KubeAnnotations: &common.InclExcl{
 							Excl: map[string]string{"prometheus.io/scrape": "false"},
 							Incl: map[string]string{"prometheus.io/scrape": "true"},
@@ -100,7 +96,6 @@ func TestSetupConfigs(t *testing.T) {
 						},
 					},
 					AD: &common.ADConfig{
-						ExcludeAutoconf: &trueVar,
 						KubeAnnotations: &common.InclExcl{
 							Excl: map[string]string{"custom/annotation": "exclude"},
 							Incl: map[string]string{"prometheus.io/scrape": "true"},
@@ -124,7 +119,6 @@ func TestSetupConfigs(t *testing.T) {
 						},
 					},
 					AD: &common.ADConfig{
-						ExcludeAutoconf: &falseVar,
 						KubeAnnotations: &common.InclExcl{
 							Incl: map[string]string{"custom/annotation": "include"},
 							Excl: map[string]string{"custom/annotation": "exclude"},
@@ -143,7 +137,6 @@ func TestSetupConfigs(t *testing.T) {
 						},
 					},
 					AD: &common.ADConfig{
-						ExcludeAutoconf: &falseVar,
 						KubeAnnotations: &common.InclExcl{
 							Incl: map[string]string{"custom/annotation": "include"},
 							Excl: map[string]string{"custom/annotation": "exclude"},
@@ -163,7 +156,7 @@ func TestSetupConfigs(t *testing.T) {
 					},
 				},
 			},
-			wantChecks: nil,
+			wantChecks: []*common.PrometheusCheck{},
 			wantErr:    false,
 		},
 		{
@@ -189,7 +182,6 @@ func TestSetupConfigs(t *testing.T) {
 						},
 					},
 					AD: &common.ADConfig{
-						ExcludeAutoconf: &trueVar,
 						KubeAnnotations: &common.InclExcl{
 							Excl: map[string]string{"prometheus.io/scrape": "false"},
 							Incl: map[string]string{"prometheus.io/scrape": "true"},
@@ -204,12 +196,12 @@ func TestSetupConfigs(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			p := &PrometheusConfigProvider{}
 			config.Datadog.Set("prometheus_scrape.checks", tt.config)
-			if err := p.setupConfigs(); (err != nil) != tt.wantErr {
-				t.Errorf("PrometheusConfigProvider.setupConfigs() error = %v, wantErr %v", err, tt.wantErr)
+			checks, err := getPrometheusConfigs()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("getPrometheusConfigs() error = %v, wantErr %v", err, tt.wantErr)
 			}
-			assert.EqualValues(t, tt.wantChecks, p.checks)
+			assert.EqualValues(t, tt.wantChecks, checks)
 		})
 	}
 }

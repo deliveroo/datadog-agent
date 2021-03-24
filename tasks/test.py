@@ -121,7 +121,7 @@ def test(
         lint(ctx, targets=tool_targets)
         misspell(ctx, targets=tool_targets)
         ineffassign(ctx, targets=tool_targets)
-        staticcheck(ctx, targets=tool_targets)
+        staticcheck(ctx, targets=tool_targets, build_tags=build_tags, arch=arch)
 
         # for now we only run golangci_lint on Unix as the Windows env need more work
         if sys.platform != 'win32':
@@ -185,7 +185,7 @@ def test(
     nocache = '-count=1' if not cache else ''
 
     build_tags.append("test")
-    cmd = 'gotestsum --format pkgname -- {verbose} -mod={go_mod} -vet=off -timeout {timeout}s -tags "{go_build_tags}" -gcflags="{gcflags}" '
+    cmd = 'go run gotest.tools/gotestsum --format pkgname -- {verbose} -mod={go_mod} -vet=off -timeout {timeout}s -tags "{go_build_tags}" -gcflags="{gcflags}" '
     cmd += '-ldflags="{ldflags}" {build_cpus} {race_opt} -short {covermode_opt} {coverprofile} {nocache} {pkg_folder}'
     args = {
         "go_mod": go_mod,
@@ -294,6 +294,7 @@ def lint_releasenote(ctx):
                 [
                     f['filename'].startswith("releasenotes/notes/")
                     or f['filename'].startswith("releasenotes-dca/notes/")
+                    or f['filename'].startswith("releasenotes-installscript/notes/")
                     for f in files
                 ]
             ):
@@ -329,6 +330,7 @@ def lint_releasenote(ctx):
                         [
                             f['filename'].startswith("releasenotes/notes/")
                             or f['filename'].startswith("releasenotes-dca/notes/")
+                            or f['filename'].startswith("releasenotes-installscript/notes/")
                             for f in files
                         ]
                     ):

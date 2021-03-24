@@ -182,8 +182,6 @@ DATADOG_AGENT_RTLOADER_API int get_check_deprecated(rtloader_t *rtloader, rtload
     \param check A rtloader_pyobject_t * pointer to the check instance we wish to run.
     \return A C-string with the check summary.
     \sa rtloader_pyobject_t, rtloader_t
-
-    This function is deprecated in favor of `get_check()`.
 */
 DATADOG_AGENT_RTLOADER_API char *run_check(rtloader_t *, rtloader_pyobject_t *check);
 
@@ -195,8 +193,6 @@ DATADOG_AGENT_RTLOADER_API char *run_check(rtloader_t *, rtloader_pyobject_t *ch
     \return An array of C-strings with found warnings for the instance, or NULL if none or
     an error occurred.
     \sa rtloader_pyobject_t, rtloader_t
-
-    This function is deprecated in favor of `get_check()`.
 */
 DATADOG_AGENT_RTLOADER_API char **get_checks_warnings(rtloader_t *, rtloader_pyobject_t *check);
 
@@ -582,6 +578,17 @@ DATADOG_AGENT_RTLOADER_API void set_read_persistent_cache_cb(rtloader_t *, cb_re
     The callback is expected to be provided by the rtloader caller - in go-context: CGO.
 */
 DATADOG_AGENT_RTLOADER_API void set_obfuscate_sql_cb(rtloader_t *, cb_obfuscate_sql_t);
+
+/*! \fn void set_obfuscate_sql_exec_plan_cb(rtloader_t *, cb_obfuscate_sql_exec_plan_t)
+    \brief Sets a callback to be used by rtloader to allow retrieving a value for a given
+    check instance.
+    \param rtloader_t A rtloader_t * pointer to the RtLoader instance.
+    \param object A function pointer with cb_obfuscate_sql_exec_plan_t prototype to the callback
+    function.
+
+    The callback is expected to be provided by the rtloader caller - in go-context: CGO.
+*/
+DATADOG_AGENT_RTLOADER_API void set_obfuscate_sql_exec_plan_cb(rtloader_t *, cb_obfuscate_sql_exec_plan_t);
 
 #ifdef __cplusplus
 }

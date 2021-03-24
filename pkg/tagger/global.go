@@ -11,13 +11,15 @@ import (
 	"github.com/DataDog/datadog-agent/cmd/agent/api/response"
 	"github.com/DataDog/datadog-agent/pkg/config"
 	"github.com/DataDog/datadog-agent/pkg/tagger/collectors"
+	"github.com/DataDog/datadog-agent/pkg/tagger/local"
+	"github.com/DataDog/datadog-agent/pkg/tagger/utils"
 	"github.com/DataDog/datadog-agent/pkg/util/containers"
 	"github.com/DataDog/datadog-agent/pkg/util/containers/providers"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
 // defaultTagger is the shared tagger instance backing the global Tag and Init functions
-var defaultTagger *Tagger
+var defaultTagger Tagger
 var initOnce sync.Once
 
 // ChecksCardinality defines the cardinality of tags we should send for check metrics
@@ -35,18 +37,26 @@ func Init() {
 		checkCard := config.Datadog.GetString("checks_tag_cardinality")
 		dsdCard := config.Datadog.GetString("dogstatsd_tag_cardinality")
 
-		ChecksCardinality, err = stringToTagCardinality(checkCard)
+		ChecksCardinality, err = collectors.StringToTagCardinality(checkCard)
 		if err != nil {
 			log.Warnf("failed to parse check tag cardinality, defaulting to low. Error: %s", err)
 			ChecksCardinality = collectors.LowCardinality
 		}
-		DogstatsdCardinality, err = stringToTagCardinality(dsdCard)
+		DogstatsdCardinality, err = collectors.StringToTagCardinality(dsdCard)
 		if err != nil {
 			log.Warnf("failed to parse dogstatsd tag cardinality, defaulting to low. Error: %s", err)
 			DogstatsdCardinality = collectors.LowCardinality
 		}
 
-		defaultTagger.Init(collectors.DefaultCatalog)
+		if config.IsCLCRunner() {
+			log.Infof("Tagger not started on CLC")
+			return
+		}
+
+		err = defaultTagger.Init()
+		if err != nil {
+			log.Errorf("failed to start the tagger: %s", err)
+		}
 	})
 }
 
@@ -55,6 +65,22 @@ func Init() {
 // or at orchestrator cardinality (pod/task level)
 func Tag(entity string, cardinality collectors.TagCardinality) ([]string, error) {
 	return defaultTagger.Tag(entity, cardinality)
+}
+
+// TagWithHash is similar to Tag but it also computes and returns the hash of the tags found
+func TagWithHash(entity string, cardinality collectors.TagCardinality) ([]string, string, error) {
+	tags, err := Tag(entity, cardinality)
+	if err != nil {
+		return tags, "", err
+	}
+	return tags, utils.ComputeTagsHash(tags), nil
+}
+
+// GetEntityHash returns the hash for the tags associated with the given entity
+// Returns an empty string if the tags lookup fails
+func GetEntityHash(entity string, cardinality collectors.TagCardinality) string {
+	_, hash, _ := TagWithHash(entity, cardinality)
+	return hash
 }
 
 // StandardTags queries the defaultTagger to get entity
@@ -90,16 +116,16 @@ func List(cardinality collectors.TagCardinality) response.TaggerListResponse {
 	return defaultTagger.List(cardinality)
 }
 
-// GetEntityHash returns the hash for the tags associated with the given entity
-func GetEntityHash(entity string) string {
-	return defaultTagger.GetEntityHash(entity)
+// SetDefaultTagger sets the global Tagger instance
+func SetDefaultTagger(tagger Tagger) {
+	defaultTagger = tagger
 }
 
 // GetDefaultTagger returns the global Tagger instance
-func GetDefaultTagger() *Tagger {
+func GetDefaultTagger() Tagger {
 	return defaultTagger
 }
 
 func init() {
-	defaultTagger = newTagger()
+	SetDefaultTagger(local.NewTagger(collectors.DefaultCatalog))
 }

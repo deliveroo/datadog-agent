@@ -4,40 +4,55 @@
 #include <linux/tty.h>
 #include <linux/sched.h>
 
+struct proc_cache_t {
+    struct container_context_t container;
+    struct file_t executable;
+
+    u64 exec_timestamp;
+    char tty_name[TTY_NAME_LEN];
+    char comm[TASK_COMM_LEN];
+};
+
 struct bpf_map_def SEC("maps/proc_cache") proc_cache = {
     .type = BPF_MAP_TYPE_LRU_HASH,
     .key_size = sizeof(u32),
     .value_size = sizeof(struct proc_cache_t),
-    .max_entries = 4095,
+    .max_entries = 4096,
     .pinning = 0,
     .namespace = "",
 };
 
-struct bpf_map_def SEC("maps/pid_cookie") pid_cookie = {
+struct pid_cache_t {
+    u32 cookie;
+    u32 ppid;
+    u64 fork_timestamp;
+    u64 exit_timestamp;
+    u32 uid;
+    u32 gid;
+};
+
+struct bpf_map_def SEC("maps/pid_cache") pid_cache = {
     .type = BPF_MAP_TYPE_LRU_HASH,
     .key_size = sizeof(u32),
-    .value_size = sizeof(u32),
-    .max_entries = 4097,
+    .value_size = sizeof(struct pid_cache_t),
+    .max_entries = 4096,
     .pinning = 0,
     .namespace = "",
 };
 
-struct proc_cache_t * __attribute__((always_inline)) get_pid_cache(u32 tgid) {
+struct proc_cache_t * __attribute__((always_inline)) get_proc_cache(u32 tgid) {
     struct proc_cache_t *entry = NULL;
 
-    u32 *cookie = (u32 *) bpf_map_lookup_elem(&pid_cookie, &tgid);
-    if (cookie) {
-        // Select the old cache entry
-        u32 cookie_key = *cookie;
-        entry = bpf_map_lookup_elem(&proc_cache, &cookie_key);
+    struct pid_cache_t *pid_entry = (struct pid_cache_t *) bpf_map_lookup_elem(&pid_cache, &tgid);
+    if (pid_entry) {
+        // Select the cache entry
+        u32 cookie = pid_entry->cookie;
+        entry = bpf_map_lookup_elem(&proc_cache, &cookie);
     }
     return entry;
 }
 
-static struct proc_cache_t * __attribute__((always_inline)) fill_process_data(struct process_context_t *data) {
-    // Comm
-    bpf_get_current_comm(&data->comm, sizeof(data->comm));
-
+static struct proc_cache_t * __attribute__((always_inline)) fill_process_context(struct process_context_t *data) {
     // Pid & Tid
     u64 pid_tgid = bpf_get_current_pid_tgid();
     u32 tgid = pid_tgid >> 32;
@@ -48,10 +63,10 @@ static struct proc_cache_t * __attribute__((always_inline)) fill_process_data(st
 
     // UID & GID
     u64 userid = bpf_get_current_uid_gid();
-    data->uid = userid >> 32;
-    data->gid = userid;
+    data->uid = userid & 0xffffffff;
+    data->gid = userid >> 32;
 
-    return NULL;
+    return get_proc_cache(tgid);
 }
 
 #endif

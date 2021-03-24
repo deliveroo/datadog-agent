@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-2020 Datadog, Inc.
 
-// +build freebsd netbsd openbsd solaris dragonfly linux
+// +build netbsd openbsd solaris dragonfly linux
 // +build !android
 
 package common
@@ -26,6 +26,8 @@ const (
 	DefaultJmxLogFile = "/var/log/datadog/jmxfetch.log"
 	// DefaultCheckFlareDirectory a flare friendly location for checks to be written
 	DefaultCheckFlareDirectory = "/var/log/datadog/checks/"
+	// DefaultJMXFlareDirectory a flare friendly location for jmx command logs to be written
+	DefaultJMXFlareDirectory = "/var/log/datadog/jmxinfo/"
 )
 
 var (

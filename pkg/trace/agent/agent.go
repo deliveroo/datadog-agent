@@ -8,6 +8,7 @@ package agent
 import (
 	"context"
 	"runtime"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/trace/pb"
 	"github.com/DataDog/datadog-agent/pkg/trace/sampler"
 	"github.com/DataDog/datadog-agent/pkg/trace/stats"
+	"github.com/DataDog/datadog-agent/pkg/trace/stats/quantile"
 	"github.com/DataDog/datadog-agent/pkg/trace/traceutil"
 	"github.com/DataDog/datadog-agent/pkg/trace/writer"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
@@ -65,11 +67,10 @@ type Agent struct {
 func NewAgent(ctx context.Context, conf *config.AgentConfig) *Agent {
 	dynConf := sampler.NewDynamicConfig(conf.DefaultEnv)
 	in := make(chan *api.Payload, 1000)
-	statsChan := make(chan []stats.Bucket)
+	statsChan := make(chan []stats.Bucket, 100)
 
-	return &Agent{
-		Receiver:           api.NewHTTPReceiver(conf, dynConf, in),
-		Concentrator:       stats.NewConcentrator(conf.ExtraAggregators, conf.BucketInterval.Nanoseconds(), statsChan),
+	agnt := &Agent{
+		Concentrator:       stats.NewConcentrator(conf.BucketInterval.Nanoseconds(), statsChan),
 		Blacklister:        filters.NewBlacklister(conf.Ignore["resource"]),
 		Replacer:           filters.NewReplacer(conf.ReplaceTags),
 		ScoreSampler:       NewScoreSampler(conf),
@@ -84,6 +85,8 @@ func NewAgent(ctx context.Context, conf *config.AgentConfig) *Agent {
 		conf:               conf,
 		ctx:                ctx,
 	}
+	agnt.Receiver = api.NewHTTPReceiver(conf, dynConf, in, agnt)
+	return agnt
 }
 
 // Run starts routers routines and individual pieces then stop them when the exit order is received
@@ -185,6 +188,9 @@ func (a *Agent) Process(p *api.Payload, sublayerCalculator *stats.SublayerCalcul
 		for _, span := range t {
 			a.obfuscator.Obfuscate(span)
 			Truncate(span)
+			if p.ClientComputedTopLevel {
+				traceutil.UpdateTracerTopLevel(span)
+			}
 		}
 		a.Replacer.Replace(t)
 
@@ -196,7 +202,6 @@ func (a *Agent) Process(p *api.Payload, sublayerCalculator *stats.SublayerCalcul
 			if ratelimiter := a.Receiver.RateLimiter; ratelimiter.Active() {
 				rate := ratelimiter.RealRate()
 				sampler.SetPreSampleRate(root, rate)
-				sampler.AddGlobalRate(root, rate)
 			}
 			if p.ContainerTags != "" {
 				traceutil.SetMeta(root, tagContainersTags, p.ContainerTags)
@@ -218,25 +223,29 @@ func (a *Agent) Process(p *api.Payload, sublayerCalculator *stats.SublayerCalcul
 			WeightedTrace: stats.NewWeightedTrace(t, root),
 			Root:          root,
 			Env:           env,
-			Sublayers:     make(map[*pb.Span][]stats.SublayerValue),
 		}
 
 		events, keep := a.sample(ts, pt)
 
-		subtraces := stats.ExtractSubtraces(t, root)
-		for _, subtrace := range subtraces {
-			subtraceSublayers := sublayerCalculator.ComputeSublayers(subtrace.Trace)
-			pt.Sublayers[subtrace.Root] = subtraceSublayers
-			if keep {
-				stats.SetSublayersOnSpan(subtrace.Root, subtraceSublayers)
+		if sublayerCalculator.ShouldCompute(keep) {
+			pt.Sublayers = make(map[*pb.Span][]stats.SublayerValue)
+			subtraces := stats.ExtractSubtraces(t, root)
+			for _, subtrace := range subtraces {
+				subtraceSublayers := sublayerCalculator.ComputeSublayers(subtrace.Trace)
+				if sublayerCalculator.WithStats() {
+					pt.Sublayers[subtrace.Root] = subtraceSublayers
+				}
+				if keep {
+					stats.SetSublayersOnSpan(subtrace.Root, subtraceSublayers)
+				}
 			}
 		}
 		sinputs = append(sinputs, stats.Input{
-			Trace:     pt.WeightedTrace,
-			Sublayers: pt.Sublayers,
-			Env:       pt.Env,
+			Trace:         pt.WeightedTrace,
+			Sublayers:     pt.Sublayers,
+			Env:           pt.Env,
+			SublayersOnly: p.ClientComputedStats,
 		})
-
 		if keep {
 			ss.Traces = append(ss.Traces, traceutil.APITrace(t))
 			ss.Size += t.Msgsize()
@@ -257,6 +266,86 @@ func (a *Agent) Process(p *api.Payload, sublayerCalculator *stats.SublayerCalcul
 	if len(sinputs) > 0 {
 		a.Concentrator.In <- sinputs
 	}
+}
+
+var _ api.StatsProcessor = (*Agent)(nil)
+
+// ProcessStats processes incoming client stats in from the given language lang.
+func (a *Agent) ProcessStats(in pb.ClientStatsPayload, lang string) {
+	if in.Env == "" {
+		in.Env = a.conf.DefaultEnv
+	}
+	in.Env = traceutil.NormalizeTag(in.Env)
+	out := stats.Payload{
+		HostName: in.Hostname,
+		Env:      in.Env,
+	}
+	for _, group := range in.Stats {
+		for _, b := range group.Stats {
+			normalizeStatsGroup(&b, lang)
+			a.obfuscator.ObfuscateStatsGroup(&b)
+			a.Replacer.ReplaceStatsGroup(&b)
+
+			statusCode := ""
+			if b.HTTPStatusCode != 0 {
+				statusCode = strconv.Itoa(int(b.HTTPStatusCode))
+			}
+			newb := stats.Bucket{
+				Start:            int64(group.Start),
+				Duration:         int64(group.Duration),
+				Counts:           make(map[string]stats.Count),
+				Distributions:    make(map[string]stats.Distribution),
+				ErrDistributions: make(map[string]stats.Distribution),
+			}
+			aggr := stats.NewAggregation(out.Env, b.Resource, b.Service, "", statusCode, in.Version, b.Synthetics)
+			tagset := aggr.ToTagSet()
+			key := stats.GrainKey(b.Name, stats.HITS, aggr)
+			newb.Counts[key] = stats.Count{
+				Key:     key,
+				Name:    b.Name,
+				Measure: stats.HITS,
+				TagSet:  tagset,
+				Value:   float64(b.Hits),
+			}
+			key = stats.GrainKey(b.Name, stats.ERRORS, aggr)
+			newb.Counts[key] = stats.Count{
+				Key:     key,
+				Name:    b.Name,
+				Measure: stats.ERRORS,
+				TagSet:  tagset,
+				Value:   float64(b.Errors),
+			}
+			key = stats.GrainKey(b.Name, stats.DURATION, aggr)
+			newb.Counts[key] = stats.Count{
+				Key:     key,
+				Name:    b.Name,
+				Measure: stats.DURATION,
+				TagSet:  tagset,
+				Value:   float64(b.Duration),
+			}
+			if hits, errors, err := quantile.DDToGKSketches(b.OkSummary, b.ErrorSummary); err != nil {
+				log.Errorf("Error handling distributions: %v", err)
+			} else {
+				newb.Distributions[key] = stats.Distribution{
+					Key:     key,
+					Name:    b.Name,
+					Measure: stats.DURATION,
+					TagSet:  tagset,
+					Summary: hits,
+				}
+				newb.ErrDistributions[key] = stats.Distribution{
+					Key:     key,
+					Name:    b.Name,
+					Measure: stats.DURATION,
+					TagSet:  tagset,
+					Summary: errors,
+				}
+			}
+			out.Stats = append(out.Stats, newb)
+		}
+	}
+
+	a.StatsWriter.SendPayload(&out)
 }
 
 // sample decides whether the trace will be kept and extracts any APM events
@@ -283,10 +372,7 @@ func (a *Agent) sample(ts *info.TagStats, pt ProcessedTrace) (events []*pb.Span,
 		return nil, false
 	}
 
-	sampled, rate := a.runSamplers(pt, hasPriority)
-	if sampled {
-		sampler.AddGlobalRate(pt.Root, rate)
-	}
+	sampled := a.runSamplers(pt, hasPriority)
 
 	events, numExtracted := a.EventProcessor.Process(pt.Root, pt.Trace)
 
@@ -298,7 +384,7 @@ func (a *Agent) sample(ts *info.TagStats, pt ProcessedTrace) (events []*pb.Span,
 
 // runSamplers runs all the agent's samplers on pt and returns the sampling decision
 // along with the sampling rate.
-func (a *Agent) runSamplers(pt ProcessedTrace, hasPriority bool) (bool, float64) {
+func (a *Agent) runSamplers(pt ProcessedTrace, hasPriority bool) bool {
 	if hasPriority {
 		return a.samplePriorityTrace(pt)
 	}
@@ -308,21 +394,19 @@ func (a *Agent) runSamplers(pt ProcessedTrace, hasPriority bool) (bool, float64)
 // samplePriorityTrace samples traces with priority set on them. PrioritySampler and
 // ErrorSampler are run in parallel. The ExceptionSampler catches traces with rare top-level
 // or measured spans that are not caught by PrioritySampler and ErrorSampler.
-func (a *Agent) samplePriorityTrace(pt ProcessedTrace) (sampled bool, rate float64) {
-	sampledPriority, ratePriority := a.PrioritySampler.Add(pt)
+func (a *Agent) samplePriorityTrace(pt ProcessedTrace) bool {
+	if a.PrioritySampler.Add(pt) {
+		return true
+	}
 	if traceContainsError(pt.Trace) {
-		sampledError, rateError := a.ErrorsScoreSampler.Add(pt)
-		return sampledError || sampledPriority, sampler.CombineRates(ratePriority, rateError)
+		return a.ErrorsScoreSampler.Add(pt)
 	}
-	if sampled := a.ExceptionSampler.Add(pt.Env, pt.Root, pt.Trace); sampled {
-		return sampled, 1
-	}
-	return sampledPriority, ratePriority
+	return a.ExceptionSampler.Add(pt.Env, pt.Root, pt.Trace)
 }
 
 // sampleNoPriorityTrace samples traces with no priority set on them. The traces
 // get sampled by either the score sampler or the error sampler if they have an error.
-func (a *Agent) sampleNoPriorityTrace(pt ProcessedTrace) (sampled bool, rate float64) {
+func (a *Agent) sampleNoPriorityTrace(pt ProcessedTrace) bool {
 	if traceContainsError(pt.Trace) {
 		return a.ErrorsScoreSampler.Add(pt)
 	}

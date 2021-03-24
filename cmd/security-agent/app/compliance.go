@@ -22,6 +22,7 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/logs/auditor"
 	"github.com/DataDog/datadog-agent/pkg/logs/client"
 	"github.com/DataDog/datadog-agent/pkg/logs/config"
+	"github.com/DataDog/datadog-agent/pkg/logs/diagnostic"
 	"github.com/DataDog/datadog-agent/pkg/logs/pipeline"
 	"github.com/DataDog/datadog-agent/pkg/logs/restart"
 	"github.com/DataDog/datadog-agent/pkg/status/health"
@@ -62,14 +63,14 @@ func init() {
 
 func eventRun(cmd *cobra.Command, args []string) error {
 	// Read configuration files received from the command line arguments '-c'
-	if err := secagentcommon.MergeConfigurationFiles("datadog", confPathArray); err != nil {
+	if err := secagentcommon.MergeConfigurationFiles("datadog", confPathArray, cmd.Flags().Lookup("cfgpath").Changed); err != nil {
 		return err
 	}
 
 	stopper := restart.NewSerialStopper()
 	defer stopper.Stop()
 
-	endpoints, dstContext, err := newLogContext()
+	endpoints, dstContext, err := newLogContextCompliance()
 	if err != nil {
 		return err
 	}
@@ -98,12 +99,12 @@ func newComplianceReporter(stopper restart.Stopper, sourceName, sourceType strin
 	health := health.RegisterLiveness("compliance")
 
 	// setup the auditor
-	auditor := auditor.New(coreconfig.Datadog.GetString("compliance_config.run_path"), "compliance-registry.json", health)
+	auditor := auditor.New(coreconfig.Datadog.GetString("compliance_config.run_path"), "compliance-registry.json", coreconfig.DefaultAuditorTTL, health)
 	auditor.Start()
 	stopper.Add(auditor)
 
 	// setup the pipeline provider that provides pairs of processor and sender
-	pipelineProvider := pipeline.NewProvider(config.NumberOfPipelines, auditor, nil, endpoints, context)
+	pipelineProvider := pipeline.NewProvider(config.NumberOfPipelines, auditor, &diagnostic.NoopMessageReceiver{}, nil, endpoints, context)
 	pipelineProvider.Start()
 	stopper.Add(pipelineProvider)
 
@@ -118,11 +119,17 @@ func newComplianceReporter(stopper restart.Stopper, sourceName, sourceType strin
 	return event.NewReporter(logSource, pipelineProvider.NextPipelineChan()), nil
 }
 
-func startCompliance(hostname string, endpoints *config.Endpoints, context *client.DestinationsContext, stopper restart.Stopper, statsdClient *ddgostatsd.Client) error {
+func startCompliance(hostname string, stopper restart.Stopper, statsdClient *ddgostatsd.Client) error {
 	enabled := coreconfig.Datadog.GetBool("compliance_config.enabled")
 	if !enabled {
 		return nil
 	}
+
+	endpoints, context, err := newLogContextCompliance()
+	if err != nil {
+		log.Error(err)
+	}
+	stopper.Add(context)
 
 	reporter, err := newComplianceReporter(stopper, "compliance-agent", "compliance", endpoints, context)
 	if err != nil {

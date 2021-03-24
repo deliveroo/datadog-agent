@@ -93,6 +93,11 @@ func getRtLoaderError() error {
 	return nil
 }
 
+// Load returns Python loader name
+func (cl *PythonCheckLoader) Name() string {
+	return "python"
+}
+
 // Load tries to import a Python module with the same name found in config.Name, searches for
 // subclasses of the AgentCheck class and returns the corresponding Check
 func (cl *PythonCheckLoader) Load(config integration.Config, instance integration.Data) (check.Check, error) {
@@ -288,7 +293,7 @@ func reportPy3Warnings(checkName string, checkFilePath string) {
 
 			if err != nil {
 				status = a7TagUnknown
-				log.Errorf("Failed to validate Python 3 linting for check '%s': '%s'", checkName, err)
+				log.Warnf("Failed to validate Python 3 linting for check '%s': '%s'", checkName, err)
 			} else if len(warnings) == 0 {
 				status = a7TagReady
 				metricValue = 1.0

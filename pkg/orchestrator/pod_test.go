@@ -3,8 +3,6 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-2020 Datadog, Inc.
 
-// +build orchestrator
-
 package orchestrator
 
 import (
@@ -80,6 +78,7 @@ func TestExtractPodMessage(t *testing.T) {
 							},
 						},
 					},
+					QOSClass: v1.PodQOSGuaranteed,
 				},
 				ObjectMeta: metav1.ObjectMeta{
 					UID:               types.UID("e42e5adc-0749-11e8-a2b8-000c29dea4f6"),
@@ -99,6 +98,7 @@ func TestExtractPodMessage(t *testing.T) {
 							UID:  types.UID("1234567890"),
 						},
 					},
+					ResourceVersion: "1234",
 				},
 				Spec: v1.PodSpec{
 					NodeName:   "node",
@@ -119,12 +119,14 @@ func TestExtractPodMessage(t *testing.T) {
 							Uid:  "1234567890",
 						},
 					},
+					ResourceVersion: "1234",
 				},
 				Phase:             "Running",
 				NominatedNodeName: "nominated",
 				NodeName:          "node",
 				RestartCount:      42,
 				Status:            "chillin",
+				QOSClass:          "Guaranteed",
 				ContainerStatuses: []*model.ContainerStatus{
 					{
 						State:        "Running",
@@ -181,6 +183,7 @@ func TestExtractPodMessage(t *testing.T) {
 							Name: "bazName",
 						},
 					},
+					QOSClass: v1.PodQOSBurstable,
 				},
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "pod",
@@ -203,6 +206,7 @@ func TestExtractPodMessage(t *testing.T) {
 				},
 				RestartCount: 10,
 				Status:       "chillin",
+				QOSClass:     "Burstable",
 				ContainerStatuses: []*model.ContainerStatus{
 					{
 						Name:        "fooName",
@@ -263,6 +267,7 @@ func TestExtractPodMessage(t *testing.T) {
 							Name: "bazName",
 						},
 					},
+					QOSClass: v1.PodQOSBestEffort,
 				},
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "pod",
@@ -309,6 +314,7 @@ func TestExtractPodMessage(t *testing.T) {
 						Name: "bazName",
 					},
 				},
+				QOSClass: "BestEffort",
 			},
 		},
 		"partial pod with resourceRequirements": {
@@ -487,191 +493,6 @@ func TestConvertResourceRequirements(t *testing.T) {
 	}
 }
 
-func TestScrubContainer(t *testing.T) {
-	scrubber := NewDefaultDataScrubber()
-	tests := getScrubCases()
-	for name, tc := range tests {
-		t.Run(name, func(t *testing.T) {
-			ScrubContainer(&tc.input, scrubber)
-			assert.Equal(t, tc.expected, tc.input)
-		})
-	}
-}
-
-func getScrubCases() map[string]struct {
-	input    v1.Container
-	expected v1.Container
-} {
-	tests := map[string]struct {
-		input    v1.Container
-		expected v1.Container
-	}{
-		"sensitive CLI": {
-			input: v1.Container{
-				Command: []string{"mysql", "--password", "afztyerbzio1234"},
-			},
-			expected: v1.Container{
-				Command: []string{"mysql", "--password", "********"},
-			},
-		},
-		"empty container": {
-			input:    v1.Container{},
-			expected: v1.Container{},
-		},
-		"empty container empty slices": {
-			input: v1.Container{
-				Command: []string{},
-				Args:    []string{},
-			},
-			expected: v1.Container{
-				Command: []string{},
-				Args:    []string{},
-			},
-		},
-		"non sensitive CLI": {
-			input: v1.Container{
-				Command: []string{"mysql", "--arg", "afztyerbzio1234"},
-			},
-			expected: v1.Container{
-				Command: []string{"mysql", "--arg", "afztyerbzio1234"},
-			},
-		},
-		"non sensitive CLI joined": {
-			input: v1.Container{
-				Command: []string{"mysql --arg afztyerbzio1234"},
-			},
-			expected: v1.Container{
-				Command: []string{"mysql --arg afztyerbzio1234"},
-			},
-		},
-		"sensitive CLI joined": {
-			input: v1.Container{
-				Command: []string{"mysql --password afztyerbzio1234"},
-			},
-			expected: v1.Container{
-				Command: []string{"mysql", "--password", "********"},
-			},
-		},
-		"sensitive env var": {
-			input: v1.Container{
-				Env: []v1.EnvVar{{Name: "password", Value: "kqhkiG9w0BAQEFAASCAl8wggJbAgEAAoGBAOLJ"}},
-			},
-			expected: v1.Container{
-				Env: []v1.EnvVar{{Name: "password", Value: "********"}},
-			},
-		},
-		"command with sensitive arg": {
-			input: v1.Container{
-				Command: []string{"mysql"},
-				Args:    []string{"--password", "afztyerbzio1234"},
-			},
-			expected: v1.Container{
-				Command: []string{"mysql"},
-				Args:    []string{"--password", "********"},
-			},
-		},
-		"command with no sensitive arg": {
-			input: v1.Container{
-				Command: []string{"mysql"},
-				Args:    []string{"--debug", "afztyerbzio1234"},
-			},
-			expected: v1.Container{
-				Command: []string{"mysql"},
-				Args:    []string{"--debug", "afztyerbzio1234"},
-			},
-		},
-		"sensitive command with no sensitive arg": {
-			input: v1.Container{
-				Command: []string{"mysql --password 123"},
-				Args:    []string{"--debug", "123"},
-			},
-			expected: v1.Container{
-				Command: []string{"mysql", "--password", "********"},
-				Args:    []string{"--debug", "123"},
-			},
-		},
-		"sensitive command with no sensitive arg joined": {
-			input: v1.Container{
-				Command: []string{"mysql --password 123"},
-				Args:    []string{"--debug 123"},
-			},
-			expected: v1.Container{
-				Command: []string{"mysql", "--password", "********"},
-				Args:    []string{"--debug", "123"},
-			},
-		},
-		"sensitive command with no sensitive arg split": {
-			input: v1.Container{
-				Command: []string{"mysql", "--password", "123"},
-				Args:    []string{"--debug", "123"},
-			},
-			expected: v1.Container{
-				Command: []string{"mysql", "--password", "********"},
-				Args:    []string{"--debug", "123"},
-			},
-		},
-		"sensitive command with no sensitive arg mixed": {
-			input: v1.Container{
-				Command: []string{"mysql", "--password", "123"},
-				Args:    []string{"--debug", "123"},
-			},
-			expected: v1.Container{
-				Command: []string{"mysql", "--password", "********"},
-				Args:    []string{"--debug", "123"},
-			},
-		},
-		"sensitive pass in args": {
-			input: v1.Container{
-				Command: []string{"agent --password"},
-				Args:    []string{"token123"},
-			},
-			expected: v1.Container{
-				Command: []string{"agent", "--password"},
-				Args:    []string{"********"},
-			},
-		},
-		"sensitive arg no command": {
-			input: v1.Container{
-				Args: []string{"password", "--password", "afztyerbzio1234"},
-			},
-			expected: v1.Container{
-				Args: []string{"password", "--password", "********"},
-			},
-		},
-		"sensitive arg joined": {
-			input: v1.Container{
-				Args: []string{"pwd pwd afztyerbzio1234 --password 1234"},
-			},
-			expected: v1.Container{
-				Args: []string{"pwd", "pwd", "********", "--password", "********"},
-			},
-		},
-		"sensitive container": {
-			input: v1.Container{
-				Name:    "test container",
-				Image:   "random",
-				Command: []string{"decrypt", "--password", "afztyerbzio1234", "--access_token", "yolo123"},
-				Env: []v1.EnvVar{
-					{Name: "hostname", Value: "password"},
-					{Name: "pwd", Value: "yolo"},
-				},
-				Args: []string{"--password", "afztyerbzio1234"},
-			},
-			expected: v1.Container{
-				Name:    "test container",
-				Image:   "random",
-				Command: []string{"decrypt", "--password", "********", "--access_token", "********"},
-				Env: []v1.EnvVar{
-					{Name: "hostname", Value: "password"},
-					{Name: "pwd", Value: "********"},
-				},
-				Args: []string{"--password", "********"},
-			},
-		},
-	}
-	return tests
-}
-
 func TestComputeStatus(t *testing.T) {
 	for nb, tc := range []struct {
 		pod    *v1.Pod
@@ -793,6 +614,14 @@ func TestGetConditionMessage(t *testing.T) {
 				},
 			},
 			message: "bar",
+		}, {
+			pod: &v1.Pod{
+				Status: v1.PodStatus{
+					Conditions: []v1.PodCondition{},
+					Message:    "Pod The node was low on resource: [DiskPressure]",
+				},
+			},
+			message: "Pod The node was low on resource: [DiskPressure]",
 		},
 	} {
 		t.Run(fmt.Sprintf("case %d", nb), func(t *testing.T) {

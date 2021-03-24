@@ -19,11 +19,11 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/logs/auditor"
 	"github.com/DataDog/datadog-agent/pkg/logs/client"
 	"github.com/DataDog/datadog-agent/pkg/logs/config"
+	"github.com/DataDog/datadog-agent/pkg/logs/diagnostic"
 	"github.com/DataDog/datadog-agent/pkg/logs/pipeline"
 	"github.com/DataDog/datadog-agent/pkg/logs/restart"
 	secagent "github.com/DataDog/datadog-agent/pkg/security/agent"
 	secconfig "github.com/DataDog/datadog-agent/pkg/security/config"
-	"github.com/DataDog/datadog-agent/pkg/security/policy"
 	sprobe "github.com/DataDog/datadog-agent/pkg/security/probe"
 	"github.com/DataDog/datadog-agent/pkg/security/rules"
 	"github.com/DataDog/datadog-agent/pkg/status/health"
@@ -46,11 +46,42 @@ var (
 	checkPoliciesArgs = struct {
 		dir string
 	}{}
+
+	dumpCmd = &cobra.Command{
+		Use:   "dump",
+		Short: "Dump security module information",
+	}
+
+	dumpProcessCacheCmd = &cobra.Command{
+		Use:   "process-cache",
+		Short: "process cache",
+		RunE:  dumpProcessCache,
+	}
 )
 
 func init() {
+	dumpCmd.AddCommand(dumpProcessCacheCmd)
+	runtimeCmd.AddCommand(dumpCmd)
+
 	runtimeCmd.AddCommand(checkPoliciesCmd)
 	checkPoliciesCmd.Flags().StringVar(&checkPoliciesArgs.dir, "policies-dir", coreconfig.DefaultRuntimePoliciesDir, "Path to policies directory")
+}
+
+func dumpProcessCache(cmd *cobra.Command, args []string) error {
+	client, err := secagent.NewRuntimeSecurityClient()
+	if err != nil {
+		return errors.Wrap(err, "unable to create a runtime security client instance")
+	}
+	defer client.Close()
+
+	filename, err := client.DumpProcessCache()
+	if err != nil {
+		return errors.Wrap(err, "unable to get a process cache dump")
+	}
+
+	fmt.Printf("Dump written: %s\n", filename)
+
+	return nil
 }
 
 func checkPolicies(cmd *cobra.Command, args []string) error {
@@ -59,15 +90,16 @@ func checkPolicies(cmd *cobra.Command, args []string) error {
 		EnableKernelFilters: true,
 		EnableApprovers:     true,
 		EnableDiscarders:    true,
+		PIDCacheSize:        1,
 	}
 
-	probe, err := sprobe.NewProbe(cfg)
+	probe, err := sprobe.NewProbe(cfg, nil)
 	if err != nil {
 		return err
 	}
 
 	ruleSet := probe.NewRuleSet(rules.NewOptsWithParams(sprobe.SECLConstants, sprobe.SupportedDiscarders))
-	if err := policy.LoadPolicies(cfg, ruleSet); err != nil {
+	if err := rules.LoadPolicies(cfg, ruleSet); err != nil {
 		return err
 	}
 
@@ -88,12 +120,12 @@ func newRuntimeReporter(stopper restart.Stopper, sourceName, sourceType string, 
 	health := health.RegisterLiveness("runtime-security")
 
 	// setup the auditor
-	auditor := auditor.New(coreconfig.Datadog.GetString("runtime_security_config.run_path"), "runtime-security-registry.json", health)
+	auditor := auditor.New(coreconfig.Datadog.GetString("runtime_security_config.run_path"), "runtime-security-registry.json", coreconfig.DefaultAuditorTTL, health)
 	auditor.Start()
 	stopper.Add(auditor)
 
 	// setup the pipeline provider that provides pairs of processor and sender
-	pipelineProvider := pipeline.NewProvider(config.NumberOfPipelines, auditor, nil, endpoints, context)
+	pipelineProvider := pipeline.NewProvider(config.NumberOfPipelines, auditor, &diagnostic.NoopMessageReceiver{}, nil, endpoints, context)
 	pipelineProvider.Start()
 	stopper.Add(pipelineProvider)
 
@@ -108,12 +140,18 @@ func newRuntimeReporter(stopper restart.Stopper, sourceName, sourceType string, 
 	return event.NewReporter(logSource, pipelineProvider.NextPipelineChan()), nil
 }
 
-func startRuntimeSecurity(hostname string, endpoints *config.Endpoints, context *client.DestinationsContext, stopper restart.Stopper, statsdClient *ddgostatsd.Client) (*secagent.RuntimeSecurityAgent, error) {
+func startRuntimeSecurity(hostname string, stopper restart.Stopper, statsdClient *ddgostatsd.Client) (*secagent.RuntimeSecurityAgent, error) {
 	enabled := coreconfig.Datadog.GetBool("runtime_security_config.enabled")
 	if !enabled {
 		log.Info("Datadog runtime security agent disabled by config")
 		return nil, nil
 	}
+
+	endpoints, context, err := newLogContextRuntime()
+	if err != nil {
+		log.Error(err)
+	}
+	stopper.Add(context)
 
 	reporter, err := newRuntimeReporter(stopper, "runtime-security-agent", "runtime-security", endpoints, context)
 	if err != nil {

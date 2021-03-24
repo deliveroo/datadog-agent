@@ -12,19 +12,17 @@ import (
 	"reflect"
 	"regexp"
 	"sort"
+	"strings"
 
 	"github.com/alecthomas/participle/lexer"
+	"github.com/pkg/errors"
 
 	"github.com/DataDog/datadog-agent/pkg/security/secl/ast"
+	"github.com/DataDog/datadog-agent/pkg/security/utils"
 )
 
 // Field name
 type Field = string
-
-// IdentEvaluator represents the evaluator of an identifier
-type IdentEvaluator struct {
-	Eval func(ctx *Context) bool
-}
 
 // FieldValueType represents the type of the value of a field
 type FieldValueType int
@@ -34,6 +32,16 @@ const (
 	ScalarValueType  FieldValueType = 1
 	PatternValueType FieldValueType = 2
 	BitmaskValueType FieldValueType = 4
+)
+
+// defines factor applied by specific operator
+const (
+	FunctionWeight       = 5
+	InArrayWeight        = 10
+	HandlerWeight        = 50
+	PatternWeight        = 100
+	InPatternArrayWeight = 1000
+	IteratorWeight       = 2000
 )
 
 // FieldValue describes a field value with its type
@@ -69,20 +77,15 @@ type EvaluatorStringer struct {
 	Evaluator Evaluator
 }
 
-func (e *EvaluatorStringer) String() string {
-	return fmt.Sprintf("%v", e.Evaluator.Eval(e.Ctx))
-}
-
-// NewEvaluatorStringer returns a new evaluator stringer
-func NewEvaluatorStringer(ctx *Context, evaluator Evaluator) *EvaluatorStringer {
-	return &EvaluatorStringer{Ctx: ctx, Evaluator: evaluator}
-}
+// BoolEvalFnc describe a eval function return a boolean
+type BoolEvalFnc = func(ctx *Context) bool
 
 // BoolEvaluator returns a bool as result of the evaluation
 type BoolEvaluator struct {
-	EvalFnc func(ctx *Context) bool
+	EvalFnc BoolEvalFnc
 	Field   Field
 	Value   bool
+	Weight  int
 
 	isPartial bool
 }
@@ -97,6 +100,7 @@ type IntEvaluator struct {
 	EvalFnc func(ctx *Context) int
 	Field   Field
 	Value   int
+	Weight  int
 
 	isPartial bool
 }
@@ -108,9 +112,11 @@ func (i *IntEvaluator) Eval(ctx *Context) interface{} {
 
 // StringEvaluator returns a string as result of the evaluation
 type StringEvaluator struct {
-	EvalFnc func(ctx *Context) string
-	Field   Field
-	Value   string
+	EvalFnc   func(ctx *Context) string
+	Field     Field
+	Value     string
+	Weight    int
+	IsPattern bool
 
 	isPartial bool
 }
@@ -128,6 +134,55 @@ type StringArray struct {
 // IntArray represents an array of integer values
 type IntArray struct {
 	Values []int
+}
+
+// PatternArray represents an array of pattern values
+type PatternArray struct {
+	Values  []string
+	Regexps []*regexp.Regexp
+}
+
+func extractField(field string) (Field, Field, RegisterID, error) {
+	var regID RegisterID
+
+	re := regexp.MustCompile(`\[([^\]]*)\]`)
+	ids := re.FindStringSubmatch(field)
+
+	switch len(ids) {
+	case 0:
+		return field, "", "", nil
+	case 2:
+		regID = ids[1]
+	default:
+		return "", "", "", errors.New("wrong register format")
+	}
+
+	re = regexp.MustCompile(`(.+)\[[^\]]+\](.+)`)
+
+	field, itField := re.ReplaceAllString(field, `$1$2`), re.ReplaceAllString(field, `$1`)
+	if field == itField {
+		return "", "", "", errors.New("wrong register format")
+	}
+
+	return field, itField, regID, nil
+}
+
+func patternToRegexp(pattern string) (*regexp.Regexp, error) {
+	// do not accept full wildcard value
+	if matched, err := regexp.Match(`[a-zA-Z0-9\.]+`, []byte(pattern)); err != nil || !matched {
+		return nil, &ErrInvalidPattern{Pattern: pattern}
+	}
+
+	// quote eveything except wilcard
+	re := regexp.MustCompile(`[\.*+?()|\[\]{}^$]`)
+	quoted := re.ReplaceAllStringFunc(pattern, func(s string) string {
+		if s != "*" {
+			return "\\" + s
+		}
+		return ".*"
+	})
+
+	return regexp.Compile("^" + quoted + "$")
 }
 
 func nodeToEvaluator(obj interface{}, opts *Opts, state *state) (interface{}, interface{}, lexer.Position, error) {
@@ -233,16 +288,22 @@ func nodeToEvaluator(obj interface{}, opts *Opts, state *state) (interface{}, in
 
 			switch unary := unary.(type) {
 			case *StringEvaluator:
-				nextStringArray, ok := next.(*StringArray)
-				if !ok {
+				switch next.(type) {
+				case *StringArray:
+					boolEvaluator, err := StringArrayContains(unary, next.(*StringArray), *obj.ArrayComparison.Op == "notin", opts, state)
+					if err != nil {
+						return nil, nil, pos, err
+					}
+					return boolEvaluator, nil, obj.Pos, nil
+				case *PatternArray:
+					boolEvaluator, err := StringArrayMatches(unary, next.(*PatternArray), *obj.ArrayComparison.Op == "notin", opts, state)
+					if err != nil {
+						return nil, nil, pos, err
+					}
+					return boolEvaluator, nil, obj.Pos, nil
+				default:
 					return nil, nil, pos, NewTypeError(pos, reflect.Array)
 				}
-
-				boolEvaluator, err := StringArrayContains(unary, nextStringArray, *obj.ArrayComparison.Op == "notin", opts, state)
-				if err != nil {
-					return nil, nil, pos, err
-				}
-				return boolEvaluator, nil, obj.Pos, nil
 			case *IntEvaluator:
 				nextIntArray, ok := next.(*IntArray)
 				if !ok {
@@ -293,17 +354,33 @@ func nodeToEvaluator(obj interface{}, opts *Opts, state *state) (interface{}, in
 
 				switch *obj.ScalarComparison.Op {
 				case "!=":
-					stringEvaluator, err := StringNotEquals(unary, nextString, opts, state)
+					var eval *BoolEvaluator
+					var err error
+
+					if nextString.IsPattern {
+						eval, err = StringMatches(unary, nextString, true, opts, state)
+					} else {
+						eval, err = StringNotEquals(unary, nextString, opts, state)
+					}
+
 					if err != nil {
 						return nil, nil, pos, err
 					}
-					return stringEvaluator, nil, pos, nil
+					return eval, nil, pos, nil
 				case "==":
-					stringEvaluator, err := StringEquals(unary, nextString, opts, state)
+					var eval *BoolEvaluator
+					var err error
+
+					if nextString.IsPattern {
+						eval, err = StringMatches(unary, nextString, false, opts, state)
+					} else {
+						eval, err = StringEquals(unary, nextString, opts, state)
+					}
+
 					if err != nil {
 						return nil, nil, pos, err
 					}
-					return stringEvaluator, nil, pos, nil
+					return eval, nil, pos, nil
 				case "=~", "!~":
 					eval, err := StringMatches(unary, nextString, *obj.ScalarComparison.Op == "!~", opts, state)
 					if err != nil {
@@ -415,12 +492,64 @@ func nodeToEvaluator(obj interface{}, opts *Opts, state *state) (interface{}, in
 				}
 			}
 
-			accessor, err := state.model.GetEvaluator(*obj.Ident)
+			field, itField, regID, err := extractField(*obj.Ident)
 			if err != nil {
 				return nil, nil, obj.Pos, err
 			}
 
-			state.UpdateFields(*obj.Ident)
+			// extract iterator
+			var iterator Iterator
+			if itField != "" {
+				if iterator, err = state.model.GetIterator(itField); err != nil {
+					return nil, nil, obj.Pos, err
+				}
+			} else {
+				// detect whether a iterator is along the path
+				var candidate string
+				for _, node := range strings.Split(field, ".") {
+					if candidate == "" {
+						candidate = node
+					} else {
+						candidate = candidate + "." + node
+					}
+
+					iterator, err = state.model.GetIterator(candidate)
+					if err == nil {
+						break
+					}
+				}
+			}
+
+			if iterator != nil {
+				// regID not specified generate one
+				if regID == "" {
+					regID = utils.RandString(8)
+				}
+
+				if info, exists := state.registersInfo[regID]; exists {
+					if info.field != itField {
+						return nil, nil, obj.Pos, NewRegisterMultipleFields(obj.Pos, regID, errors.New("used by multiple fields"))
+					}
+
+					info.subFields[field] = true
+				} else {
+					info = &registerInfo{
+						field:    itField,
+						iterator: iterator,
+						subFields: map[Field]bool{
+							field: true,
+						},
+					}
+					state.registersInfo[regID] = info
+				}
+			}
+
+			accessor, err := state.model.GetEvaluator(field, regID)
+			if err != nil {
+				return nil, nil, obj.Pos, err
+			}
+
+			state.UpdateFields(field)
 
 			return accessor, nil, obj.Pos, nil
 		case obj.Number != nil:
@@ -430,6 +559,11 @@ func nodeToEvaluator(obj interface{}, opts *Opts, state *state) (interface{}, in
 		case obj.String != nil:
 			return &StringEvaluator{
 				Value: *obj.String,
+			}, nil, obj.Pos, nil
+		case obj.Pattern != nil:
+			return &StringEvaluator{
+				Value:     *obj.Pattern,
+				IsPattern: true,
 			}, nil, obj.Pos, nil
 		case obj.SubExpression != nil:
 			return nodeToEvaluator(obj.SubExpression, opts, state)
@@ -441,8 +575,42 @@ func nodeToEvaluator(obj interface{}, opts *Opts, state *state) (interface{}, in
 			ints := obj.Numbers
 			sort.Ints(ints)
 			return &IntArray{Values: ints}, nil, obj.Pos, nil
-		} else if len(obj.Strings) != 0 {
-			strs := obj.Strings
+		} else if len(obj.StringMembers) != 0 {
+			var strs []string
+			var hasPatterns bool
+
+			for _, member := range obj.StringMembers {
+				if member.String != nil {
+					strs = append(strs, *member.String)
+				} else {
+					strs = append(strs, *member.Pattern)
+					hasPatterns = true
+				}
+			}
+
+			if hasPatterns {
+				var regs []*regexp.Regexp
+				var reg *regexp.Regexp
+				var err error
+
+				for _, member := range obj.StringMembers {
+					if member.String != nil {
+						// escape wildcard
+						str := strings.ReplaceAll(*member.String, "*", "\\*")
+
+						if reg, err = patternToRegexp(str); err != nil {
+							return nil, nil, obj.Pos, NewError(obj.Pos, fmt.Sprintf("invalid pattern '%s': %s", *member.String, err))
+						}
+					} else {
+						if reg, err = patternToRegexp(*member.Pattern); err != nil {
+							return nil, nil, obj.Pos, NewError(obj.Pos, fmt.Sprintf("invalid pattern '%s': %s", *member.Pattern, err))
+						}
+					}
+					regs = append(regs, reg)
+				}
+				return &PatternArray{Values: strs, Regexps: regs}, nil, obj.Pos, nil
+			}
+
 			sort.Strings(strs)
 			return &StringArray{Values: strs}, nil, obj.Pos, nil
 		} else if obj.Ident != nil {

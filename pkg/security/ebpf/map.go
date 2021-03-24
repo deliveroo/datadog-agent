@@ -3,7 +3,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-2020 Datadog, Inc.
 
-// +build linux_bpf
+// +build linux
 
 package ebpf
 
@@ -80,4 +80,9 @@ var (
 	ZeroUint8MapItem  = BytesMapItem([]byte{0})
 	ZeroUint32MapItem = BytesMapItem([]byte{0, 0, 0, 0})
 	ZeroUint64MapItem = BytesMapItem([]byte{0, 0, 0, 0, 0, 0, 0, 0})
+)
+
+var (
+	// BufferSelectorSyscallMonitorKey is the key used to select the active syscall monitor buffer key
+	BufferSelectorSyscallMonitorKey = ZeroUint32MapItem
 )

@@ -32,6 +32,13 @@ type ObfuscationConfig struct {
 	// Mongo holds the obfuscation configuration for MongoDB queries.
 	Mongo JSONObfuscationConfig `mapstructure:"mongodb"`
 
+	// SQLExecPlan holds the obfuscation configuration for SQL Exec Plans. This is strictly for safety related obfuscation,
+	// not normalization. Normalization of exec plans is configured in SQLExecPlanNormalize.
+	SQLExecPlan JSONObfuscationConfig `mapstructure:"sql_exec_plan"`
+
+	// SQLExecPlanNormalize holds the normalization configuration for SQL Exec Plans.
+	SQLExecPlanNormalize JSONObfuscationConfig `mapstructure:"sql_exec_plan_normalize"`
+
 	// HTTP holds the obfuscation settings for HTTP URLs.
 	HTTP HTTPObfuscationConfig `mapstructure:"http"`
 
@@ -71,6 +78,10 @@ type JSONObfuscationConfig struct {
 	// KeepValues will specify a set of keys for which their values will
 	// not be obfuscated.
 	KeepValues []string `mapstructure:"keep_values"`
+
+	// ObfuscateSQLValues will specify a set of keys for which their values
+	// will be passed through SQL obfuscation
+	ObfuscateSQLValues []string `mapstructure:"obfuscate_sql_values"`
 }
 
 // ReplaceRule specifies a replace rule.
@@ -206,7 +217,7 @@ func (c *AgentConfig) applyDatadogConfig() error {
 		c.MaxEPS = config.Datadog.GetFloat64("apm_config.max_events_per_second")
 	}
 	if config.Datadog.IsSet("apm_config.max_traces_per_second") {
-		c.MaxTPS = config.Datadog.GetFloat64("apm_config.max_traces_per_second")
+		c.TargetTPS = config.Datadog.GetFloat64("apm_config.max_traces_per_second")
 	}
 	if k := "apm_config.ignore_resources"; config.Datadog.IsSet(k) {
 		c.Ignore["resource"] = config.Datadog.GetStringSlice(k)
@@ -227,15 +238,20 @@ func (c *AgentConfig) applyDatadogConfig() error {
 		}
 	}
 
-	if config.Datadog.IsSet("bind_host") {
-		host := config.Datadog.GetString("bind_host")
-		c.StatsdHost = host
-		c.ReceiverHost = host
-	}
-	if config.Datadog.IsSet("apm_config.apm_non_local_traffic") {
-		if config.Datadog.GetBool("apm_config.apm_non_local_traffic") {
+	if config.Datadog.IsSet("bind_host") || config.Datadog.IsSet("apm_config.apm_non_local_traffic") {
+		if config.Datadog.IsSet("bind_host") {
+			host := config.Datadog.GetString("bind_host")
+			c.StatsdHost = host
+			c.ReceiverHost = host
+		}
+
+		if config.Datadog.IsSet("apm_config.apm_non_local_traffic") && config.Datadog.GetBool("apm_config.apm_non_local_traffic") {
 			c.ReceiverHost = "0.0.0.0"
 		}
+	} else if config.IsContainerized() {
+		// Automatically activate non local traffic in containerized environment if no explicit config set
+		log.Info("Activating non-local traffic automatically in containerized environment, trace-agent will listen on 0.0.0.0")
+		c.ReceiverHost = "0.0.0.0"
 	}
 
 	if config.Datadog.IsSet("apm_config.obfuscation") {
@@ -328,13 +344,6 @@ func (c *AgentConfig) loadDeprecatedValues() error {
 	}
 	if cfg.IsSet("apm_config.log_level") {
 		c.LogLevel = config.Datadog.GetString("apm_config.log_level")
-	}
-	if v := cfg.GetString("apm_config.extra_aggregators"); len(v) > 0 {
-		aggs, err := splitString(v, ',')
-		if err != nil {
-			return err
-		}
-		c.ExtraAggregators = append(c.ExtraAggregators, aggs...)
 	}
 	if cfg.IsSet("apm_config.log_throttling") {
 		c.LogThrottling = cfg.GetBool("apm_config.log_throttling")

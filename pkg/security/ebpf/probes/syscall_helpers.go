@@ -13,6 +13,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/DataDog/datadog-agent/pkg/util/log"
 	"github.com/DataDog/ebpf/manager"
 )
 
@@ -43,7 +44,8 @@ func getSyscallPrefix() string {
 	if syscallPrefix == "" {
 		syscall, err := manager.GetSyscallFnName("open")
 		if err != nil {
-			panic(err)
+			log.Error(err)
+			return "__unknown__"
 		}
 		syscallPrefix = strings.ToLower(strings.TrimSuffix(syscall, "open"))
 		if syscallPrefix != "sys_" {
@@ -83,7 +85,7 @@ func expandSyscallSections(syscallName string, flag int, compat ...bool) []strin
 	sections := expandKprobe(getSyscallFnName(syscallName), flag)
 
 	if RuntimeArch == "x64" {
-		if len(compat) > 0 && syscallPrefix != "sys_" {
+		if len(compat) > 0 && compat[0] && syscallPrefix != "sys_" {
 			sections = append(sections, expandKprobe(getCompatSyscallFnName(syscallName), flag)...)
 		} else {
 			sections = append(sections, expandKprobe(getIA32SyscallFnName(syscallName), flag)...)

@@ -9,6 +9,7 @@ import (
 	"expvar"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -138,14 +139,15 @@ type Forwarder interface {
 	Start() error
 	Stop()
 	SubmitV1Series(payload Payloads, extra http.Header) error
-	SubmitV1Intake(payload Payloads, extra http.Header, priority TransactionPriority) error
+	SubmitV1Intake(payload Payloads, extra http.Header) error
 	SubmitV1CheckRuns(payload Payloads, extra http.Header) error
 	SubmitSeries(payload Payloads, extra http.Header) error
 	SubmitEvents(payload Payloads, extra http.Header) error
 	SubmitServiceChecks(payload Payloads, extra http.Header) error
 	SubmitSketchSeries(payload Payloads, extra http.Header) error
 	SubmitHostMetadata(payload Payloads, extra http.Header) error
-	SubmitMetadata(payload Payloads, extra http.Header, priority TransactionPriority) error
+	SubmitAgentChecksMetadata(payload Payloads, extra http.Header) error
+	SubmitMetadata(payload Payloads, extra http.Header) error
 	SubmitProcessChecks(payload Payloads, extra http.Header) (chan Response, error)
 	SubmitRTProcessChecks(payload Payloads, extra http.Header) (chan Response, error)
 	SubmitContainerChecks(payload Payloads, extra http.Header) (chan Response, error)
@@ -157,17 +159,43 @@ type Forwarder interface {
 // Compile-time check to ensure that DefaultForwarder implements the Forwarder interface
 var _ Forwarder = &DefaultForwarder{}
 
+// Features is a bitmask to enable specific forwarder features
+type Features uint8
+
+const (
+	// CoreFeatures bitmask to enable specific core features
+	CoreFeatures Features = 1 << iota
+	// TraceFeatures bitmask to enable specific trace features
+	TraceFeatures
+	// ProcessFeatures bitmask to enable specific process features
+	ProcessFeatures
+	// SysProbeFeatures bitmask to enable specific system-probe features
+	SysProbeFeatures
+)
+
 // Options contain the configuration options for the DefaultForwarder
 type Options struct {
 	NumberOfWorkers                int
-	RetryQueueSize                 int
 	RetryQueuePayloadsTotalMaxSize int
 	DisableAPIKeyChecking          bool
+	EnabledFeatures                Features
 	APIKeyValidationInterval       time.Duration
 	KeysPerDomain                  map[string][]string
 	ConnectionResetInterval        time.Duration
 	CompletionHandler              HTTPCompletionHandler
 }
+
+// SetFeature sets forwarder features in a feature set
+func SetFeature(features, flag Features) Features { return features | flag }
+
+// ClearFeature clears forwarder features from a feature set
+func ClearFeature(features, flag Features) Features { return features &^ flag }
+
+// ToggleFeature toggles forwarder features in a feature set
+func ToggleFeature(features, flag Features) Features { return features ^ flag }
+
+// HasFeature lets you know if a specific feature flag is set in a feature set
+func HasFeature(features, flag Features) bool { return features&flag != 0 }
 
 // NewOptions creates new Options with default values
 func NewOptions(keysPerDomain map[string][]string) *Options {
@@ -180,25 +208,47 @@ func NewOptions(keysPerDomain map[string][]string) *Options {
 		)
 		validationInterval = config.DefaultAPIKeyValidationInterval
 	}
+
 	const forwarderRetryQueueMaxSizeKey = "forwarder_retry_queue_max_size"
 	const forwarderRetryQueuePayloadsMaxSizeKey = "forwarder_retry_queue_payloads_max_size"
-	retryQueueSize := config.Datadog.GetInt(forwarderRetryQueueMaxSizeKey)
-	retryQueuePayloadsTotalMaxSize := config.Datadog.GetInt(forwarderRetryQueuePayloadsMaxSizeKey)
 
-	if retryQueueSize > 0 {
-		log.Warnf("'%s' is deprecated. It is recommended to use '%s' as it takes the payload sizes into account.", forwarderRetryQueueMaxSizeKey, forwarderRetryQueuePayloadsMaxSizeKey)
-		retryQueuePayloadsTotalMaxSize = 0
+	retryQueuePayloadsTotalMaxSize := 15 * 1024 * 1024
+	if config.Datadog.IsSet(forwarderRetryQueuePayloadsMaxSizeKey) {
+		retryQueuePayloadsTotalMaxSize = config.Datadog.GetInt(forwarderRetryQueuePayloadsMaxSizeKey)
 	}
 
-	return &Options{
+	option := &Options{
 		NumberOfWorkers:                config.Datadog.GetInt("forwarder_num_workers"),
-		RetryQueueSize:                 retryQueueSize,
-		RetryQueuePayloadsTotalMaxSize: retryQueuePayloadsTotalMaxSize,
 		DisableAPIKeyChecking:          false,
+		RetryQueuePayloadsTotalMaxSize: retryQueuePayloadsTotalMaxSize,
 		APIKeyValidationInterval:       time.Duration(validationInterval) * time.Minute,
 		KeysPerDomain:                  keysPerDomain,
 		ConnectionResetInterval:        time.Duration(config.Datadog.GetInt("forwarder_connection_reset_interval")) * time.Second,
 	}
+
+	if config.Datadog.IsSet(forwarderRetryQueueMaxSizeKey) {
+		if config.Datadog.IsSet(forwarderRetryQueuePayloadsMaxSizeKey) {
+			log.Warnf("'%v' is set, but as this setting is deprecated, '%v' is used instead.", forwarderRetryQueueMaxSizeKey, forwarderRetryQueuePayloadsMaxSizeKey)
+		} else {
+			forwarderRetryQueueMaxSize := config.Datadog.GetInt(forwarderRetryQueueMaxSizeKey)
+			option.setRetryQueuePayloadsTotalMaxSizeFromQueueMax(forwarderRetryQueueMaxSize)
+			log.Warnf("'%v = %v' is used, but this setting is deprecated. '%v = %v' (%v * 2MB) is used instead as the maximum payload size is 2MB.",
+				forwarderRetryQueueMaxSizeKey,
+				forwarderRetryQueueMaxSize,
+				forwarderRetryQueuePayloadsMaxSizeKey,
+				option.RetryQueuePayloadsTotalMaxSize,
+				forwarderRetryQueueMaxSize)
+		}
+	}
+
+	return option
+}
+
+// setRetryQueuePayloadsTotalMaxSizeFromQueueMax set `RetryQueuePayloadsTotalMaxSize` from the value
+// of the deprecated settings `forwarder_retry_queue_max_size`
+func (o *Options) setRetryQueuePayloadsTotalMaxSizeFromQueueMax(v int) {
+	maxPayloadSize := 2 * 1024 * 1024
+	o.RetryQueuePayloadsTotalMaxSize = v * maxPayloadSize
 }
 
 // DefaultForwarder is the default implementation of the Forwarder.
@@ -215,6 +265,30 @@ type DefaultForwarder struct {
 	completionHandler HTTPCompletionHandler
 }
 
+type sortByCreatedTimeAndPriority struct {
+	highPriorityFirst bool
+}
+
+func (s sortByCreatedTimeAndPriority) Sort(transactions []Transaction) {
+	sorter := byCreatedTimeAndPriority(transactions)
+	if s.highPriorityFirst {
+		sort.Sort(sorter)
+	} else {
+		sort.Sort(sort.Reverse(sorter))
+	}
+}
+
+type byCreatedTimeAndPriority []Transaction
+
+func (v byCreatedTimeAndPriority) Len() int      { return len(v) }
+func (v byCreatedTimeAndPriority) Swap(i, j int) { v[i], v[j] = v[j], v[i] }
+func (v byCreatedTimeAndPriority) Less(i, j int) bool {
+	if v[i].GetPriority() != v[j].GetPriority() {
+		return v[i].GetPriority() > v[j].GetPriority()
+	}
+	return v[i].GetCreatedAt().After(v[j].GetCreatedAt())
+}
+
 // NewDefaultForwarder returns a new DefaultForwarder.
 func NewDefaultForwarder(options *Options) *DefaultForwarder {
 	f := &DefaultForwarder{
@@ -229,15 +303,74 @@ func NewDefaultForwarder(options *Options) *DefaultForwarder {
 		},
 		completionHandler: options.CompletionHandler,
 	}
+	var optionalRemovalPolicy *failedTransactionRemovalPolicy
+	storageMaxSize := config.Datadog.GetInt64("forwarder_storage_max_size_in_bytes")
+
+	// Disk Persistence is a core-only feature for now.
+	if storageMaxSize == 0 {
+		log.Infof("Retry queue storage on disk is disabled")
+	} else if HasFeature(options.EnabledFeatures, CoreFeatures) {
+		storagePath := config.Datadog.GetString("forwarder_storage_path")
+		outdatedFileInDays := config.Datadog.GetInt("forwarder_outdated_file_in_days")
+		var err error
+
+		optionalRemovalPolicy, err = newFailedTransactionRemovalPolicy(storagePath, outdatedFileInDays, failedTransactionRemovalPolicyTelemetry{})
+		if err != nil {
+			log.Errorf("Error when initializing the removal policy: %v", err)
+		} else {
+			filesRemoved, err := optionalRemovalPolicy.removeOutdatedFiles()
+			if err != nil {
+				log.Errorf("Error when removing outdated files: %v", err)
+			}
+			log.Debugf("Outdated files removed: %v", strings.Join(filesRemoved, ", "))
+		}
+	} else {
+		log.Infof("Retry queue storage on disk is disabled because the feature is unavailable for this process.")
+	}
+
+	flushToDiskMemRatio := config.Datadog.GetFloat64("forwarder_flush_to_disk_mem_ratio")
+	domainForwarderSort := sortByCreatedTimeAndPriority{highPriorityFirst: true}
+	transactionContainerSort := sortByCreatedTimeAndPriority{highPriorityFirst: false}
 
 	for domain, keys := range options.KeysPerDomain {
 		domain, _ := config.AddAgentVersionToDomain(domain, "app")
 		if keys == nil || len(keys) == 0 {
 			log.Errorf("No API keys for domain '%s', dropping domain ", domain)
 		} else {
+			var domainFolderPath string
+			var err error
+			if optionalRemovalPolicy != nil {
+				domainFolderPath, err = optionalRemovalPolicy.registerDomain(domain)
+				if err != nil {
+					log.Errorf("Retry queue storage on disk disabled. Cannot register the domain '%v': %v", domain, err)
+				}
+			}
+
+			transactionContainer := buildTransactionContainer(
+				options.RetryQueuePayloadsTotalMaxSize,
+				flushToDiskMemRatio,
+				domainFolderPath,
+				storageMaxSize,
+				transactionContainerSort,
+				domain,
+				keys)
+
 			f.keysPerDomains[domain] = keys
-			f.domainForwarders[domain] = newDomainForwarder(domain, options.NumberOfWorkers, options.RetryQueueSize, options.RetryQueuePayloadsTotalMaxSize, options.ConnectionResetInterval)
+			f.domainForwarders[domain] = newDomainForwarder(
+				domain,
+				transactionContainer,
+				options.NumberOfWorkers,
+				options.ConnectionResetInterval,
+				domainForwarderSort)
 		}
+	}
+
+	if optionalRemovalPolicy != nil {
+		filesRemoved, err := optionalRemovalPolicy.removeUnknownDomains()
+		if err != nil {
+			log.Errorf("Error when removing outdated files: %v", err)
+		}
+		log.Debugf("Outdated files removed: %v", strings.Join(filesRemoved, ", "))
 	}
 
 	return f
@@ -330,10 +463,10 @@ func (f *DefaultForwarder) State() uint32 {
 	return f.internalState
 }
 func (f *DefaultForwarder) createHTTPTransactions(endpoint endpoint, payloads Payloads, apiKeyInQueryString bool, extra http.Header) []*HTTPTransaction {
-	return f.createPriorityHTTPTransactions(endpoint, payloads, apiKeyInQueryString, extra, TransactionPriorityNormal)
+	return f.createAdvancedHTTPTransactions(endpoint, payloads, apiKeyInQueryString, extra, TransactionPriorityNormal, true)
 }
 
-func (f *DefaultForwarder) createPriorityHTTPTransactions(endpoint endpoint, payloads Payloads, apiKeyInQueryString bool, extra http.Header, priority TransactionPriority) []*HTTPTransaction {
+func (f *DefaultForwarder) createAdvancedHTTPTransactions(endpoint endpoint, payloads Payloads, apiKeyInQueryString bool, extra http.Header, priority TransactionPriority, storableOnDisk bool) []*HTTPTransaction {
 	transactions := make([]*HTTPTransaction, 0, len(payloads)*len(f.keysPerDomains))
 	allowArbitraryTags := config.Datadog.GetBool("allow_arbitrary_tags")
 
@@ -348,6 +481,7 @@ func (f *DefaultForwarder) createPriorityHTTPTransactions(endpoint endpoint, pay
 				}
 				t.Payload = payload
 				t.priority = priority
+				t.storableOnDisk = storableOnDisk
 				t.Headers.Set(apiHTTPHeaderKey, apiKey)
 				t.Headers.Set(versionHTTPHeaderKey, version.AgentVersion)
 				t.Headers.Set(useragentHTTPHeaderKey, fmt.Sprintf("datadog-agent/%s", version.AgentVersion))
@@ -413,14 +547,27 @@ func (f *DefaultForwarder) SubmitSketchSeries(payload Payloads, extra http.Heade
 
 // SubmitHostMetadata will send a host_metadata tag type payload to Datadog backend.
 func (f *DefaultForwarder) SubmitHostMetadata(payload Payloads, extra http.Header) error {
-	transactions := f.createHTTPTransactions(hostMetadataEndpoint, payload, false, extra)
-	return f.sendHTTPTransactions(transactions)
+	return f.submitV1IntakeWithTransactionsFactory(payload, extra,
+		func(endpoint endpoint, payloads Payloads, apiKeyInQueryString bool, extra http.Header) []*HTTPTransaction {
+			// Host metadata contains the API KEY and should not be stored on disk.
+			storableOnDisk := false
+			return f.createAdvancedHTTPTransactions(endpoint, payloads, apiKeyInQueryString, extra, TransactionPriorityHigh, storableOnDisk)
+		})
+}
+
+// SubmitAgentChecksMetadata will send a agentchecks_metadata tag type payload to Datadog backend.
+func (f *DefaultForwarder) SubmitAgentChecksMetadata(payload Payloads, extra http.Header) error {
+	return f.submitV1IntakeWithTransactionsFactory(payload, extra,
+		func(endpoint endpoint, payloads Payloads, apiKeyInQueryString bool, extra http.Header) []*HTTPTransaction {
+			// Agentchecks metadata contains the API KEY and should not be stored on disk.
+			storableOnDisk := false
+			return f.createAdvancedHTTPTransactions(endpoint, payloads, apiKeyInQueryString, extra, TransactionPriorityNormal, storableOnDisk)
+		})
 }
 
 // SubmitMetadata will send a metadata type payload to Datadog backend.
-func (f *DefaultForwarder) SubmitMetadata(payload Payloads, extra http.Header, priority TransactionPriority) error {
-	transactions := f.createPriorityHTTPTransactions(metadataEndpoint, payload, false, extra, priority)
-	return f.sendHTTPTransactions(transactions)
+func (f *DefaultForwarder) SubmitMetadata(payload Payloads, extra http.Header) error {
+	return f.submitV1IntakeWithTransactionsFactory(payload, extra, f.createHTTPTransactions)
 }
 
 // SubmitV1Series will send timeserie to v1 endpoint (this will be remove once
@@ -438,8 +585,15 @@ func (f *DefaultForwarder) SubmitV1CheckRuns(payload Payloads, extra http.Header
 }
 
 // SubmitV1Intake will send payloads to the universal `/intake/` endpoint used by Agent v.5
-func (f *DefaultForwarder) SubmitV1Intake(payload Payloads, extra http.Header, priority TransactionPriority) error {
-	transactions := f.createPriorityHTTPTransactions(v1IntakeEndpoint, payload, true, extra, priority)
+func (f *DefaultForwarder) SubmitV1Intake(payload Payloads, extra http.Header) error {
+	return f.submitV1IntakeWithTransactionsFactory(payload, extra, f.createHTTPTransactions)
+}
+
+func (f *DefaultForwarder) submitV1IntakeWithTransactionsFactory(
+	payload Payloads,
+	extra http.Header,
+	createHTTPTransactions func(endpoint endpoint, payload Payloads, apiKeyInQueryString bool, extra http.Header) []*HTTPTransaction) error {
+	transactions := createHTTPTransactions(v1IntakeEndpoint, payload, true, extra)
 
 	// the intake endpoint requires the Content-Type header to be set
 	for _, t := range transactions {
