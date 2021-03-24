@@ -503,7 +503,7 @@ func (s *Server) parseMetricMessage(metricSamples []metrics.MetricSample, parser
 		if s.filter != nil {
 			metricSamples[idx].Tags = s.filter.Filter(metricSamples[idx].Tags)
 		}
-		
+
 		dogstatsdMetricPackets.Add(1)
 		tlmProcessed.IncWithTags(tlmProcessedOkTags)
 	}
