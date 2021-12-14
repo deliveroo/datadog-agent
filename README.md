@@ -1,3 +1,7 @@
+# ARCHIVED
+
+This fork is no longer needed, we use the upstream instead
+
 # Datadog Agent (Deliveroo Edition)
 
 This is a light fork of the DataDog Agent to track local customisations to the
